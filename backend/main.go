@@ -44,11 +44,28 @@ type agentRecord struct {
 	CPUName        string   `json:"cpu_name"`
 	RAMTotalGB     *float64 `json:"ram_total_gb"`
 	EmpID          string   `json:"emp_id"`
+	Type           string   `json:"type"`
+	Dep            string   `json:"dep"`
+	OfficeVersion  string   `json:"office_version"`
 	CreatedAt      string   `json:"created_at"`
 }
 
 type updateEmpRequest struct {
 	EmpID string `json:"emp_id"`
+}
+
+type agentMutationRequest struct {
+	Hostname       string   `json:"hostname"`
+	IPAddress      string   `json:"ip_address"`
+	MACAddress     string   `json:"mac_address"`
+	Username       string   `json:"username"`
+	WindowsVersion string   `json:"windows_version"`
+	CPUName        string   `json:"cpu_name"`
+	RAMTotalGB     *float64 `json:"ram_total_gb"`
+	EmpID          string   `json:"emp_id"`
+	Type           string   `json:"type"`
+	Dep            string   `json:"dep"`
+	OfficeVersion  string   `json:"office_version"`
 }
 
 type employeeAPIResponse struct {
@@ -108,7 +125,7 @@ func connectionString() string {
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -135,11 +152,17 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleAgents(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		a.handleListAgents(w, r)
+	case http.MethodPost:
+		a.handleCreateAgent(w, r)
+	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
 	}
+}
 
+func (a *app) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
@@ -150,6 +173,30 @@ func (a *app) handleAgents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, records)
+}
+
+func (a *app) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
+	var req agentMutationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	normalized, err := normalizeAgentMutation(req, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	record, err := a.createAgent(ctx, normalized)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, record)
 }
 
 func (a *app) handleAgentByID(w http.ResponseWriter, r *http.Request) {
@@ -164,22 +211,35 @@ func (a *app) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req updateEmpRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json body")
-		return
-	}
-
-	empID := strings.ToUpper(strings.TrimSpace(req.EmpID))
-	if len(empID) > 20 {
-		writeError(w, http.StatusBadRequest, "emp_id must be 20 characters or less")
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	record, err := a.updateEmpID(ctx, id, empID)
+	var record agentRecord
+	if isEmpIDEndpoint(r.URL.Path) {
+		var req updateEmpRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+		empID := strings.ToUpper(strings.TrimSpace(req.EmpID))
+		if len(empID) > 20 {
+			writeError(w, http.StatusBadRequest, "emp_id must be 20 characters or less")
+			return
+		}
+		record, err = a.updateEmpID(ctx, id, empID)
+	} else {
+		var req agentMutationRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid json body")
+			return
+		}
+		normalized, err := normalizeAgentMutation(req, false)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		record, err = a.updateAgentEditable(ctx, id, normalized.EmpID, normalized.Type, normalized.Dep)
+	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "agent not found")
@@ -234,6 +294,9 @@ SELECT
     cpu_name,
     ram_total_gb,
     emp_id,
+    [type],
+    dep,
+    office_version,
     created_at
 FROM dbo.Agent_TNLX
 ORDER BY created_at DESC, id DESC;
@@ -246,7 +309,7 @@ ORDER BY created_at DESC, id DESC;
 	records := make([]agentRecord, 0)
 	for rows.Next() {
 		var record agentRecord
-		var hostname, ipAddress, macAddress, username, windowsVersion, cpuName, empID sql.NullString
+		var hostname, ipAddress, macAddress, username, windowsVersion, cpuName, empID, agentType, dep, officeVersion sql.NullString
 		var ram sql.NullFloat64
 		var createdAt sql.NullTime
 
@@ -260,6 +323,9 @@ ORDER BY created_at DESC, id DESC;
 			&cpuName,
 			&ram,
 			&empID,
+			&agentType,
+			&dep,
+			&officeVersion,
 			&createdAt,
 		); err != nil {
 			return nil, err
@@ -272,6 +338,9 @@ ORDER BY created_at DESC, id DESC;
 		record.WindowsVersion = windowsVersion.String
 		record.CPUName = cpuName.String
 		record.EmpID = empID.String
+		record.Type = agentType.String
+		record.Dep = dep.String
+		record.OfficeVersion = officeVersion.String
 		if ram.Valid {
 			value := ram.Float64
 			record.RAMTotalGB = &value
@@ -282,6 +351,33 @@ ORDER BY created_at DESC, id DESC;
 		records = append(records, record)
 	}
 	return records, rows.Err()
+}
+
+func (a *app) createAgent(ctx context.Context, req agentMutationRequest) (agentRecord, error) {
+	var newID int
+	err := a.db.QueryRowContext(ctx, `
+INSERT INTO dbo.Agent_TNLX
+    (hostname, ip_address, mac_address, username, windows_version, cpu_name, emp_id, ram_total_gb, last_seen, created_at, updated_at, status_mac, office_version, [type], dep)
+OUTPUT INSERTED.id
+VALUES
+    (@p1, @p2, @p3, @p4, @p5, @p6, @p7, @p8, GETDATE(), GETDATE(), GETDATE(), '1', @p9, @p10, @p11);
+`,
+		nullableString(req.Hostname),
+		nullableString(req.IPAddress),
+		nullableString(req.MACAddress),
+		nullableString(req.Username),
+		nullableString(req.WindowsVersion),
+		nullableString(req.CPUName),
+		nullableString(req.EmpID),
+		req.RAMTotalGB,
+		nullableString(req.OfficeVersion),
+		nullableString(req.Type),
+		nullableString(req.Dep),
+	).Scan(&newID)
+	if err != nil {
+		return agentRecord{}, err
+	}
+	return a.getAgent(ctx, newID)
 }
 
 func (a *app) updateEmpID(ctx context.Context, id int, empID string) (agentRecord, error) {
@@ -310,6 +406,29 @@ WHERE id = @p2;
 	return a.getAgent(ctx, id)
 }
 
+func (a *app) updateAgentEditable(ctx context.Context, id int, empID, agentType, dep string) (agentRecord, error) {
+	result, err := a.db.ExecContext(ctx, `
+UPDATE dbo.Agent_TNLX
+SET emp_id = @p1,
+    [type] = @p2,
+    dep = @p3,
+    updated_at = GETDATE()
+WHERE id = @p4;
+`, nullableString(empID), nullableString(agentType), nullableString(dep), id)
+	if err != nil {
+		return agentRecord{}, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return agentRecord{}, err
+	}
+	if rowsAffected == 0 {
+		return agentRecord{}, sql.ErrNoRows
+	}
+
+	return a.getAgent(ctx, id)
+}
+
 func (a *app) getAgent(ctx context.Context, id int) (agentRecord, error) {
 	rows, err := a.db.QueryContext(ctx, `
 SELECT
@@ -322,6 +441,9 @@ SELECT
     cpu_name,
     ram_total_gb,
     emp_id,
+    [type],
+    dep,
+    office_version,
     created_at
 FROM dbo.Agent_TNLX
 WHERE id = @p1;
@@ -345,10 +467,10 @@ func scanAgentRows(rows *sql.Rows) ([]agentRecord, error) {
 	records := make([]agentRecord, 0)
 	for rows.Next() {
 		var record agentRecord
-		var hostname, ipAddress, macAddress, username, windowsVersion, cpuName, empID sql.NullString
+		var hostname, ipAddress, macAddress, username, windowsVersion, cpuName, empID, agentType, dep, officeVersion sql.NullString
 		var ram sql.NullFloat64
 		var createdAt sql.NullTime
-		if err := rows.Scan(&record.ID, &hostname, &ipAddress, &macAddress, &username, &windowsVersion, &cpuName, &ram, &empID, &createdAt); err != nil {
+		if err := rows.Scan(&record.ID, &hostname, &ipAddress, &macAddress, &username, &windowsVersion, &cpuName, &ram, &empID, &agentType, &dep, &officeVersion, &createdAt); err != nil {
 			return nil, err
 		}
 		record.Hostname = hostname.String
@@ -358,6 +480,9 @@ func scanAgentRows(rows *sql.Rows) ([]agentRecord, error) {
 		record.WindowsVersion = windowsVersion.String
 		record.CPUName = cpuName.String
 		record.EmpID = empID.String
+		record.Type = agentType.String
+		record.Dep = dep.String
+		record.OfficeVersion = officeVersion.String
 		if ram.Valid {
 			value := ram.Float64
 			record.RAMTotalGB = &value
@@ -372,16 +497,60 @@ func scanAgentRows(rows *sql.Rows) ([]agentRecord, error) {
 
 func parseAgentID(path string) (int, error) {
 	const prefix = "/api/agents/"
-	const suffix = "/emp-id"
-	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+	if !strings.HasPrefix(path, prefix) {
 		return 0, errors.New("invalid agent endpoint")
 	}
-	rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	rawID := strings.TrimPrefix(path, prefix)
+	rawID = strings.TrimSuffix(rawID, "/")
+	rawID = strings.TrimSuffix(rawID, "/emp-id")
+	if strings.Contains(rawID, "/") {
+		return 0, errors.New("invalid agent endpoint")
+	}
 	id, err := strconv.Atoi(rawID)
 	if err != nil || id <= 0 {
 		return 0, errors.New("invalid agent id")
 	}
 	return id, nil
+}
+
+func isEmpIDEndpoint(path string) bool {
+	return strings.HasSuffix(strings.TrimSuffix(path, "/"), "/emp-id")
+}
+
+func normalizeAgentMutation(req agentMutationRequest, requireHostname bool) (agentMutationRequest, error) {
+	req.Hostname = trimTo(strings.TrimSpace(req.Hostname), 100)
+	req.IPAddress = trimTo(strings.TrimSpace(req.IPAddress), 50)
+	req.MACAddress = trimTo(strings.ToUpper(strings.TrimSpace(req.MACAddress)), 50)
+	req.Username = trimTo(strings.TrimSpace(req.Username), 100)
+	req.WindowsVersion = trimTo(strings.TrimSpace(req.WindowsVersion), 255)
+	req.CPUName = trimTo(strings.TrimSpace(req.CPUName), 255)
+	req.EmpID = strings.ToUpper(trimTo(strings.TrimSpace(req.EmpID), 20))
+	req.Type = strings.TrimSpace(req.Type)
+	req.Dep = trimTo(strings.TrimSpace(req.Dep), 100)
+	req.OfficeVersion = trimTo(strings.TrimSpace(req.OfficeVersion), 255)
+
+	if requireHostname && req.Hostname == "" {
+		return agentMutationRequest{}, errors.New("hostname is required")
+	}
+	if req.Type != "" && req.Type != "PC" && req.Type != "Notebook" {
+		return agentMutationRequest{}, errors.New("type must be PC or Notebook")
+	}
+	return req, nil
+}
+
+func nullableString(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func trimTo(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return value[:max]
 }
 
 func (a *app) buildExcel(ctx context.Context, records []agentRecord) (*excelize.File, error) {
@@ -404,6 +573,9 @@ func (a *app) buildExcel(ctx context.Context, records []agentRecord) (*excelize.
 		"cpu_name",
 		"ram_total_gb",
 		"emp_id",
+		"type",
+		"dep",
+		"office_version",
 		"info_name, info_surname",
 		"info_nickname",
 		"created_at",
@@ -428,7 +600,7 @@ func (a *app) buildExcel(ctx context.Context, records []agentRecord) (*excelize.
 		Fill:      excelize.Fill{Type: "pattern", Color: []string{"1E293B"}, Pattern: 1},
 		Alignment: &excelize.Alignment{Horizontal: "center", Vertical: "center"},
 	})
-	file.SetCellStyle(sheet, "A1", "L1", headerStyle)
+	file.SetCellStyle(sheet, "A1", "O1", headerStyle)
 
 	employeeCache := make(map[string]employeeInfo)
 	for rowIndex, record := range records {
@@ -457,6 +629,9 @@ func (a *app) buildExcel(ctx context.Context, records []agentRecord) (*excelize.
 			record.CPUName,
 			nullableFloat(record.RAMTotalGB),
 			record.EmpID,
+			record.Type,
+			record.Dep,
+			record.OfficeVersion,
 			fullName,
 			nickname,
 			record.CreatedAt,
@@ -469,7 +644,8 @@ func (a *app) buildExcel(ctx context.Context, records []agentRecord) (*excelize.
 
 	widths := map[string]float64{
 		"A": 10, "B": 22, "C": 18, "D": 20, "E": 24, "F": 34,
-		"G": 36, "H": 14, "I": 14, "J": 28, "K": 18, "L": 22,
+		"G": 36, "H": 14, "I": 14, "J": 14, "K": 16, "L": 22,
+		"M": 28, "N": 18, "O": 22,
 	}
 	for column, width := range widths {
 		file.SetColWidth(sheet, column, column, width)

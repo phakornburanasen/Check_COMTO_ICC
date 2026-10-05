@@ -120,6 +120,8 @@ BEGIN
         [windows_version]  [varchar](255) NULL,
         [cpu_name]         [varchar](255) NULL,
 		[emp_id]         [varchar](20) NULL,
+        [dep]              [nvarchar](100) NULL,
+        [type]             [nvarchar](50) NULL,
         [ram_total_gb]     [decimal](10,2) NULL,
         [last_boot_time]   [datetime] NULL,
 
@@ -144,6 +146,22 @@ BEGIN
     ON [PRIMARY];
 
     PRINT 'Table Agent_TNLX created successfully.';
+END
+GO
+
+IF COL_LENGTH('dbo.Agent_TNLX', 'dep') IS NULL
+BEGIN
+    ALTER TABLE dbo.Agent_TNLX
+    ADD dep NVARCHAR(100) NULL;
+    PRINT 'Column Agent_TNLX.dep added successfully.';
+END
+GO
+
+IF COL_LENGTH('dbo.Agent_TNLX', 'type') IS NULL
+BEGIN
+    ALTER TABLE dbo.Agent_TNLX
+    ADD [type] NVARCHAR(50) NULL;
+    PRINT 'Column Agent_TNLX.type added successfully.';
 END
 GO
 

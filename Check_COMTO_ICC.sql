@@ -262,3 +262,12 @@ GO
 
 TRUNCATE TABLE dbo.Agent_TNLX;
 GO
+
+
+
+select * from dbo.Agent_TNLX;
+
+
+ALTER TABLE dbo.Agent_TNLX
+ADD dep NVARCHAR(100) NULL,
+    type NVARCHAR(50) NULL;
